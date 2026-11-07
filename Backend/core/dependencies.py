@@ -1,5 +1,5 @@
 from fastapi import Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -8,15 +8,17 @@ from db.database import get_db
 from models.user import User
 
 
-oauth2_scheme = OAuth2PasswordBearer(
-    tokenUrl="/auth/login"
-)
+oauth2_scheme = HTTPBearer()
 
 
 async def get_current_user(
-    token: str = Depends(oauth2_scheme),
+    credentials: HTTPAuthorizationCredentials = Depends(
+        oauth2_scheme
+    ),
     db: AsyncSession = Depends(get_db),
 ):
+    token = credentials.credentials
+
     try:
         payload = decode_access_token(token)
 

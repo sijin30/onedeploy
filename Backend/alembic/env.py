@@ -8,6 +8,7 @@ from core.config import settings
 from db.database import Base
 from models.user import User
 from models.refresh_token import RefreshToken
+from models.project import Project
 
 config = context.config
 

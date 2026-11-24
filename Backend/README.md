@@ -9,10 +9,16 @@ Create a project and service using the authenticated `/projects` and
    `{"repository_url":"https://github.com/owner/repository"}` to clone a
    public GitHub repository into OneDeploy's managed workspace.
 2. `POST /projects/{project_id}/services/{service_id}/build` to build its
-   root `Dockerfile` as a service-tagged image.
+   root `Dockerfile` as a versioned image. Each build receives a new `v1`,
+   `v2`, etc. tag; `latest` remains an alias for the newest successful build.
 3. `POST /projects/{project_id}/services/{service_id}/containers` with optional
-   `ports` (for example `{"8000/tcp":8000}`) and `environment` mappings to
-   start a container.
+   `ports` (for example `{"8000/tcp":8000}`), `environment` mappings, and
+   `image_version` to start a container. Omitting `image_version` continues to
+   deploy `latest`.
+
+`GET /projects/{project_id}/services/{service_id}/image-versions` lists build
+history, and `GET /projects/{project_id}/services/{service_id}/deployments`
+lists container deployment attempts and their current status.
 
 The service-scoped container endpoints list containers, retrieve logs, start,
 stop, restart, and remove them. A reachable Docker Engine is required; its

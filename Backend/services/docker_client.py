@@ -76,6 +76,19 @@ def build_docker_image(
         client.close()
 
 
+def tag_docker_image(image_id: str, repository: str, tag: str) -> None:
+    """Apply an additional tag to an existing local image."""
+    client = create_docker_client()
+    try:
+        tagged = client.images.get(image_id).tag(repository, tag=tag)
+        if not tagged:
+            raise docker.errors.DockerException(
+                f"Unable to tag image {image_id} as {repository}:{tag}"
+            )
+    finally:
+        client.close()
+
+
 def run_docker_container(
     image: str,
     name: str,

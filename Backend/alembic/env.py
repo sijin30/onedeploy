@@ -11,6 +11,8 @@ from models.refresh_token import RefreshToken
 from models.project import Project
 from models.service import Service
 from models.incident import Incident
+from models.image_version import ImageVersion
+from models.deployment import Deployment
 
 config = context.config
 

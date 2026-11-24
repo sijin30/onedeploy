@@ -26,6 +26,7 @@ class DockerContainerCreate(BaseModel):
     environment: dict[str, str] = Field(default_factory=dict)
     health_url: str | None = Field(default=None)
     auto_heal: bool = Field(default=True)
+    image_version: int | None = Field(default=None, ge=1)
 
     @field_validator("ports")
     @classmethod
@@ -44,6 +45,35 @@ class DockerContainerCreate(BaseModel):
 class DockerImageResponse(BaseModel):
     id: str
     tags: list[str]
+
+
+class ImageVersionResponse(BaseModel):
+    id: uuid.UUID
+    service_id: uuid.UUID
+    version: int
+    image_tag: str
+    image_id: str | None
+    status: str
+    error: str | None
+    created_at: datetime
+    completed_at: datetime | None
+
+    model_config = {"from_attributes": True}
+
+
+class DeploymentResponse(BaseModel):
+    id: uuid.UUID
+    service_id: uuid.UUID
+    image_version_id: uuid.UUID | None
+    image_tag: str
+    image_id: str | None
+    container_id: str | None
+    status: str
+    error: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
 
 
 class DockerContainerResponse(BaseModel):

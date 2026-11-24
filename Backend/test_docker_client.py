@@ -121,6 +121,35 @@ class DockerClientTests(unittest.TestCase):
         )
         self.client.close.assert_called_once_with()
 
+    def test_tag_docker_image_adds_tag_and_closes_client(self):
+        image = self.client.images.get.return_value
+        image.tag.return_value = True
+
+        with patch.object(
+            docker_client, "create_docker_client", return_value=self.client
+        ):
+            docker_client.tag_docker_image(
+                "sha256:image", "onedeploy/service", "latest"
+            )
+
+        self.client.images.get.assert_called_once_with("sha256:image")
+        image.tag.assert_called_once_with("onedeploy/service", tag="latest")
+        self.client.close.assert_called_once_with()
+
+    def test_tag_docker_image_raises_when_docker_rejects_tag(self):
+        image = self.client.images.get.return_value
+        image.tag.return_value = False
+
+        with patch.object(
+            docker_client, "create_docker_client", return_value=self.client
+        ):
+            with self.assertRaises(docker.errors.DockerException):
+                docker_client.tag_docker_image(
+                    "sha256:image", "onedeploy/service", "latest"
+                )
+
+        self.client.close.assert_called_once_with()
+
     def test_run_docker_container_starts_detached_container(self):
         container = self.client.containers.run.return_value
         labels = {"com.onedeploy.service": "service-id"}

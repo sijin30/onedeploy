@@ -177,6 +177,9 @@ async def create_service_container(
 ):
     await _require_service(project_id, service_id, current_user, db)
     labels = _service_labels(project_id, service_id)
+    if request.health_url:
+        labels["com.onedeploy.health-url"] = request.health_url
+    labels["com.onedeploy.auto-heal"] = str(request.auto_heal).lower()
     image_tag = f"onedeploy/{project_id.hex}-{service_id.hex}:latest"
     try:
         container = await run_in_threadpool(

@@ -237,6 +237,33 @@ class DockerClientTests(unittest.TestCase):
         container.logs.assert_called_once_with()
         self.client.close.assert_called_once_with()
 
+    def test_get_docker_container_stats_calculates_usage(self):
+        container = self.client.containers.get.return_value
+        container.stats.return_value = {
+            "cpu_stats": {
+                "cpu_usage": {"total_usage": 500, "percpu_usage": [1, 1]},
+                "system_cpu_usage": 1000,
+                "online_cpus": 2,
+            },
+            "precpu_stats": {
+                "cpu_usage": {"total_usage": 400},
+                "system_cpu_usage": 800,
+            },
+            "memory_stats": {"usage": 500, "limit": 1000},
+        }
+
+        with patch.object(
+            docker_client, "create_docker_client", return_value=self.client
+        ):
+            result = docker_client.get_docker_container_stats("container-id")
+
+        self.assertEqual(
+            result,
+            {"cpu_percent": 100.0, "memory_percent": 50.0},
+        )
+        container.stats.assert_called_once_with(stream=False)
+        self.client.close.assert_called_once_with()
+
 
 if __name__ == "__main__":
     unittest.main()

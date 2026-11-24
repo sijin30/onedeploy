@@ -24,6 +24,8 @@ class GitHubRepositoryCreate(BaseModel):
 class DockerContainerCreate(BaseModel):
     ports: dict[str, int] = Field(default_factory=dict)
     environment: dict[str, str] = Field(default_factory=dict)
+    health_url: str | None = Field(default=None)
+    auto_heal: bool = Field(default=True)
 
     @field_validator("ports")
     @classmethod

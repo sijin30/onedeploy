@@ -10,6 +10,7 @@ from models.user import User
 from models.refresh_token import RefreshToken
 from models.project import Project
 from models.service import Service
+from models.incident import Incident
 
 config = context.config
 

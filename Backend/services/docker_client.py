@@ -48,6 +48,15 @@ def list_running_containers() -> list[Container]:
         client.close()
 
 
+def list_all_containers() -> list[Container]:
+    """Return every container in the Docker Engine, including stopped containers."""
+    client = create_docker_client()
+    try:
+        return client.containers.list(all=True)
+    finally:
+        client.close()
+
+
 def build_docker_image(
     context_path: Path,
     tag: str,
@@ -145,5 +154,46 @@ def get_docker_container_logs(container_id: str) -> str:
     try:
         container = client.containers.get(container_id)
         return container.logs().decode("utf-8", errors="replace")
+    finally:
+        client.close()
+
+
+def get_docker_container_stats(container_id: str) -> dict[str, float]:
+    """Return a container's CPU and memory usage as percentages."""
+    client = create_docker_client()
+    try:
+        container = client.containers.get(container_id)
+        stats = container.stats(stream=False)
+
+        cpu_stats = stats.get("cpu_stats", {})
+        precpu_stats = stats.get("precpu_stats", {})
+        cpu_usage = cpu_stats.get("cpu_usage", {})
+        precpu_usage = precpu_stats.get("cpu_usage", {})
+        cpu_delta = cpu_usage.get("total_usage", 0) - precpu_usage.get(
+            "total_usage", 0
+        )
+        system_delta = cpu_stats.get("system_cpu_usage", 0) - precpu_stats.get(
+            "system_cpu_usage", 0
+        )
+        online_cpus = cpu_stats.get("online_cpus")
+        if online_cpus is None:
+            online_cpus = len(cpu_usage.get("percpu_usage", []))
+
+        cpu_percent = (
+            (cpu_delta / system_delta) * online_cpus * 100
+            if system_delta > 0 and cpu_delta >= 0
+            else 0.0
+        )
+
+        memory = stats.get("memory_stats", {})
+        memory_usage = memory.get("usage", 0)
+        memory_limit = memory.get("limit", 0)
+        memory_percent = (
+            memory_usage / memory_limit * 100 if memory_limit > 0 else 0.0
+        )
+        return {
+            "cpu_percent": round(cpu_percent, 2),
+            "memory_percent": round(memory_percent, 2),
+        }
     finally:
         client.close()

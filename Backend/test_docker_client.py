@@ -1,3 +1,4 @@
+from pathlib import Path
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -97,6 +98,143 @@ class DockerClientTests(unittest.TestCase):
             with self.assertRaises(docker.errors.DockerException):
                 docker_client.list_running_containers()
 
+        self.client.close.assert_called_once_with()
+
+    def test_build_docker_image_builds_with_tag_and_labels(self):
+        image = MagicMock()
+        self.client.images.build.return_value = (image, iter(()))
+        labels = {"com.onedeploy.project": "project-id"}
+
+        with patch.object(
+            docker_client, "create_docker_client", return_value=self.client
+        ):
+            result = docker_client.build_docker_image(
+                Path("repository"), "onedeploy/test:latest", labels
+            )
+
+        self.assertIs(result, image)
+        self.client.images.build.assert_called_once_with(
+            path=str(Path("repository")),
+            tag="onedeploy/test:latest",
+            rm=True,
+            labels=labels,
+        )
+        self.client.close.assert_called_once_with()
+
+    def test_run_docker_container_starts_detached_container(self):
+        container = self.client.containers.run.return_value
+        labels = {"com.onedeploy.service": "service-id"}
+        ports = {"8000/tcp": 8000}
+        environment = {"MODE": "test"}
+
+        with patch.object(
+            docker_client, "create_docker_client", return_value=self.client
+        ):
+            result = docker_client.run_docker_container(
+                "onedeploy/test:latest",
+                "onedeploy-test",
+                labels,
+                ports,
+                environment,
+            )
+
+        self.assertIs(result, container)
+        self.client.containers.run.assert_called_once_with(
+            "onedeploy/test:latest",
+            name="onedeploy-test",
+            detach=True,
+            labels=labels,
+            ports=ports,
+            environment=environment,
+        )
+        container.reload.assert_called_once_with()
+        self.client.close.assert_called_once_with()
+
+    def test_list_service_containers_filters_by_labels(self):
+        expected_containers = [MagicMock()]
+        self.client.containers.list.return_value = expected_containers
+        labels = {
+            "com.onedeploy.project": "project-id",
+            "com.onedeploy.service": "service-id",
+        }
+
+        with patch.object(
+            docker_client, "create_docker_client", return_value=self.client
+        ):
+            result = docker_client.list_service_containers(labels)
+
+        self.assertIs(result, expected_containers)
+        self.client.containers.list.assert_called_once_with(
+            all=True,
+            filters={
+                "label": [
+                    "com.onedeploy.project=project-id",
+                    "com.onedeploy.service=service-id",
+                ]
+            },
+        )
+        self.client.close.assert_called_once_with()
+
+    def test_get_docker_container_reload_and_close(self):
+        container = self.client.containers.get.return_value
+
+        with patch.object(
+            docker_client, "create_docker_client", return_value=self.client
+        ):
+            result = docker_client.get_docker_container("container-id")
+
+        self.assertIs(result, container)
+        self.client.containers.get.assert_called_once_with("container-id")
+        container.reload.assert_called_once_with()
+        self.client.close.assert_called_once_with()
+
+    def test_manage_docker_container_applies_lifecycle_action(self):
+        container = self.client.containers.get.return_value
+
+        for action in ("start", "stop", "restart"):
+            with self.subTest(action=action):
+                self.client.reset_mock()
+                container.reset_mock()
+
+                with patch.object(
+                    docker_client,
+                    "create_docker_client",
+                    return_value=self.client,
+                ):
+                    result = docker_client.manage_docker_container(
+                        "container-id", action
+                    )
+
+                self.assertIs(result, container)
+                getattr(container, action).assert_called_once_with()
+                container.reload.assert_called_once_with()
+                self.client.close.assert_called_once_with()
+
+    def test_manage_docker_container_removes_container(self):
+        container = self.client.containers.get.return_value
+
+        with patch.object(
+            docker_client, "create_docker_client", return_value=self.client
+        ):
+            result = docker_client.manage_docker_container(
+                "container-id", "remove"
+            )
+
+        self.assertIsNone(result)
+        container.remove.assert_called_once_with()
+        self.client.close.assert_called_once_with()
+
+    def test_get_docker_container_logs_decodes_text(self):
+        container = self.client.containers.get.return_value
+        container.logs.return_value = b"hello\n"
+
+        with patch.object(
+            docker_client, "create_docker_client", return_value=self.client
+        ):
+            result = docker_client.get_docker_container_logs("container-id")
+
+        self.assertEqual(result, "hello\n")
+        container.logs.assert_called_once_with()
         self.client.close.assert_called_once_with()
 
 

@@ -15,3 +15,5 @@ Backend/.venv
 # Environment variables / secrets
 Backend/.env
 
+# Local repository checkouts created by OneDeploy
+Backend/.onedeploy/

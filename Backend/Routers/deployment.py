@@ -6,13 +6,17 @@ import docker
 from fastapi import APIRouter, Depends, HTTPException, status
 from git import GitCommandError
 from docker.models.containers import Container
+from redis.exceptions import RedisError
+from rq.exceptions import NoSuchJobError
+from rq.job import Job
+from rq import Retry
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
 from core.dependencies import get_current_user
 from db.database import get_db
-from models.deployment import Deployment
+from models.deployment import Deployment, DeploymentStatus
 from models.image_version import ImageVersion
 from models.service import Service
 from models.user import User
@@ -20,6 +24,7 @@ from schemas.service import (
     DockerContainerCreate,
     DockerContainerResponse,
     DockerImageResponse,
+    DeploymentJobResponse,
     DeploymentResponse,
     GitHubRepositoryCreate,
     ImageVersionResponse,
@@ -32,6 +37,8 @@ from services.repository import (
     repository_workspace_path,
 )
 from services.service import get_project_service
+from services.queue import deployment_queue, redis_connection
+from services.tasks import deploy_service
 
 
 router = APIRouter(
@@ -94,23 +101,27 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-async def _update_deployment(
+async def _enqueue_deployment(
+    deployment: Deployment,
     db: AsyncSession,
-    container_id: str,
-    service_id: UUID,
-    deployment_status: str,
 ) -> None:
-    result = await db.execute(
-        select(Deployment).where(
-            Deployment.container_id == container_id,
-            Deployment.service_id == service_id,
+    try:
+        job = deployment_queue.enqueue(
+            deploy_service,
+            str(deployment.id),
+            job_id=str(deployment.id),
+            retry=Retry(max=2, interval=[5, 15]),
         )
-    )
-    deployment = result.scalar_one_or_none()
-    if deployment is not None:
-        deployment.status = deployment_status
-        deployment.updated_at = _utcnow()
+        deployment.queue_job_id = job.id
         await db.commit()
+    except (RedisError, OSError) as error:
+        deployment.transition_to(DeploymentStatus.FAILED)
+        deployment.error = f"Unable to enqueue deployment: {error}"
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Deployment queue is unavailable",
+        ) from error
 
 
 @router.post("/github", status_code=status.HTTP_201_CREATED)
@@ -271,6 +282,46 @@ async def list_service_deployments(
     return result.scalars().all()
 
 
+@router.get(
+    "/deployments/{deployment_id}/job",
+    response_model=DeploymentJobResponse,
+)
+async def get_service_deployment_job(
+    project_id: UUID,
+    service_id: UUID,
+    deployment_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await _require_service(project_id, service_id, current_user, db)
+    result = await db.execute(
+        select(Deployment).where(
+            Deployment.id == deployment_id,
+            Deployment.service_id == service_id,
+        )
+    )
+    deployment = result.scalar_one_or_none()
+    if deployment is None:
+        raise HTTPException(status_code=404, detail="Deployment not found")
+    if deployment.queue_job_id is None:
+        raise HTTPException(status_code=404, detail="Queue job not found")
+
+    try:
+        job = Job.fetch(
+            deployment.queue_job_id,
+            connection=redis_connection,
+        )
+    except NoSuchJobError as error:
+        raise HTTPException(status_code=404, detail="Queue job not found") from error
+
+    job_status = job.get_status(refresh=True)
+    return DeploymentJobResponse(
+        deployment_id=deployment.id,
+        job_id=job.id,
+        job_status=job_status.value,
+    )
+
+
 @router.get("/images", response_model=list[DockerImageResponse])
 async def list_service_images(
     project_id: UUID,
@@ -291,8 +342,8 @@ async def list_service_images(
 
 @router.post(
     "/containers",
-    response_model=DockerContainerResponse,
-    status_code=status.HTTP_201_CREATED,
+    response_model=DeploymentResponse,
+    status_code=status.HTTP_202_ACCEPTED,
 )
 async def create_service_container(
     project_id: UUID,
@@ -302,11 +353,6 @@ async def create_service_container(
     current_user: User = Depends(get_current_user),
 ):
     await _require_service(project_id, service_id, current_user, db)
-    labels = _service_labels(project_id, service_id)
-    if request.health_url:
-        labels["com.onedeploy.health-url"] = request.health_url
-    labels["com.onedeploy.auto-heal"] = str(request.auto_heal).lower()
-
     image_version = None
     if request.image_version is not None:
         result = await db.execute(
@@ -325,7 +371,6 @@ async def create_service_container(
             )
         image_tag = image_version.image_tag
     else:
-        latest_tag = f"onedeploy/{project_id.hex}-{service_id.hex}:latest"
         result = await db.execute(
             select(ImageVersion)
             .where(
@@ -336,47 +381,119 @@ async def create_service_container(
             .limit(1)
         )
         image_version = result.scalar_one_or_none()
-        image_tag = image_version.image_tag if image_version else latest_tag
+        if image_version is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Build the service image before starting a deployment",
+            )
+        image_tag = image_version.image_tag
 
     deployment = Deployment(
+        id=uuid4(),
         service_id=service_id,
         image_version_id=image_version.id if image_version else None,
         image_tag=image_tag,
         image_id=image_version.image_id if image_version else None,
-        status="starting",
+        status=DeploymentStatus.PENDING.value,
+        ports=request.ports,
+        environment=request.environment,
+        health_url=request.health_url,
+        auto_heal=request.auto_heal,
     )
     db.add(deployment)
     await db.commit()
-    try:
-        container = await run_in_threadpool(
-            docker_client.run_docker_container,
-            image_tag,
-            f"od-{project_id.hex[:8]}-{service_id.hex[:8]}-{uuid4().hex[:8]}",
-            labels,
-            request.ports,
-            request.environment,
+    await _enqueue_deployment(deployment, db)
+    return deployment
+
+
+@router.post(
+    "/deployments/{deployment_id}/rollback",
+    response_model=DeploymentResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def rollback_service_deployment(
+    project_id: UUID,
+    service_id: UUID,
+    deployment_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await _require_service(project_id, service_id, current_user, db)
+    result = await db.execute(
+        select(Deployment).where(
+            Deployment.id == deployment_id,
+            Deployment.service_id == service_id,
         )
-    except docker.errors.ImageNotFound as error:
-        deployment.status = "failed"
-        deployment.error = str(error)
-        deployment.updated_at = _utcnow()
-        await db.commit()
+    )
+    deployment_to_rollback = result.scalar_one_or_none()
+    if deployment_to_rollback is None:
+        raise HTTPException(status_code=404, detail="Deployment not found")
+    if deployment_to_rollback.status in {
+        DeploymentStatus.PENDING,
+        DeploymentStatus.BUILDING,
+    }:
         raise HTTPException(
             status_code=409,
-            detail="Build the service image version before starting a container",
-        ) from error
-    except docker.errors.DockerException as error:
-        deployment.status = "failed"
-        deployment.error = str(error)
-        deployment.updated_at = _utcnow()
-        await db.commit()
-        raise _docker_error(error) from error
-    deployment.container_id = container.id
-    deployment.image_id = container.attrs.get("Image", deployment.image_id)
-    deployment.status = container.status
-    deployment.updated_at = _utcnow()
+            detail="Wait for the deployment to finish before rolling it back",
+        )
+    if deployment_to_rollback.status == DeploymentStatus.ROLLED_BACK:
+        raise HTTPException(
+            status_code=409,
+            detail="Deployment has already been rolled back",
+        )
+    result = await db.execute(
+        select(Deployment).where(
+            Deployment.rollback_of_id == deployment_to_rollback.id,
+            Deployment.status.in_(
+                [
+                    DeploymentStatus.PENDING,
+                    DeploymentStatus.BUILDING,
+                    DeploymentStatus.RUNNING,
+                ]
+            ),
+        )
+    )
+    if result.scalar_one_or_none() is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="A rollback for this deployment is already in progress",
+        )
+
+    result = await db.execute(
+        select(Deployment)
+        .where(
+            Deployment.service_id == service_id,
+            Deployment.created_at < deployment_to_rollback.created_at,
+            Deployment.status == DeploymentStatus.RUNNING,
+            Deployment.image_version_id.is_not(None),
+        )
+        .order_by(Deployment.created_at.desc())
+        .limit(1)
+    )
+    known_good = result.scalar_one_or_none()
+    if known_good is None:
+        raise HTTPException(
+            status_code=409,
+            detail="No previous successful deployment is available to roll back to",
+        )
+
+    rollback = Deployment(
+        id=uuid4(),
+        service_id=service_id,
+        image_version_id=known_good.image_version_id,
+        rollback_of_id=deployment_to_rollback.id,
+        image_tag=known_good.image_tag,
+        image_id=known_good.image_id,
+        status=DeploymentStatus.PENDING.value,
+        ports=known_good.ports,
+        environment=known_good.environment,
+        health_url=known_good.health_url,
+        auto_heal=known_good.auto_heal,
+    )
+    db.add(rollback)
     await db.commit()
-    return _container_response(container)
+    await _enqueue_deployment(rollback, db)
+    return rollback
 
 
 @router.get("/containers", response_model=list[DockerContainerResponse])
@@ -446,7 +563,6 @@ async def manage_service_container(
         container = await run_in_threadpool(
             docker_client.manage_docker_container, container_id, action
         )
-        await _update_deployment(db, container_id, service_id, container.status)
     except docker.errors.NotFound as error:
         raise HTTPException(status_code=404, detail="Container not found") from error
     except docker.errors.DockerException as error:
@@ -476,7 +592,6 @@ async def remove_service_container(
         await run_in_threadpool(
             docker_client.manage_docker_container, container_id, "remove"
         )
-        await _update_deployment(db, container_id, service_id, "removed")
     except docker.errors.NotFound as error:
         raise HTTPException(status_code=404, detail="Container not found") from error
     except docker.errors.DockerException as error:

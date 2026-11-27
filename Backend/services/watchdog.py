@@ -12,6 +12,7 @@ from sqlalchemy import or_, select
 from core.config import settings
 from db.database import SessionLocal
 from models.incident import Incident
+from models.service import Service
 from services import docker_client
 
 
@@ -20,10 +21,7 @@ PROJECT_LABEL = "com.onedeploy.project"
 SERVICE_LABEL = "com.onedeploy.service"
 HEALTH_URL_LABEL = "com.onedeploy.health-url"
 HEALTH_EXCLUDED_LABEL = "com.onedeploy.auto-heal"
-
-_failed_checks: dict[str, int] = {}
-_restart_attempts: dict[str, int] = {}
-_stop_event = asyncio.Event()
+DEPLOYMENT_LABEL = "com.onedeploy.deployment"
 
 
 def _utcnow() -> datetime:
@@ -62,6 +60,21 @@ def assess_container(container) -> tuple[bool, str]:
         return False, f"Unable to read container resource usage: {error}"
 
     return True, "Healthy"
+
+
+async def _is_active_deployment(container) -> bool:
+    async with SessionLocal() as db:
+        result = await db.execute(
+            select(Service.active_deployment_id).where(
+                Service.id == uuid.UUID(container.labels[SERVICE_LABEL])
+            )
+        )
+        active_deployment_id = result.scalar_one_or_none()
+
+    return (
+        active_deployment_id is None
+        or container.labels.get(DEPLOYMENT_LABEL) == str(active_deployment_id)
+    )
 
 
 async def _record_incident(
@@ -112,13 +125,13 @@ async def _record_incident(
 
 
 async def check_once() -> None:
-    all_containers = []
     try:
         all_containers = await asyncio.to_thread(
             docker_client.list_all_containers
         )
     except docker.errors.DockerException as error:
         logger.error("Watchdog could not list service containers: %s", error)
+        return
 
     for container in all_containers:
         if (
@@ -126,16 +139,13 @@ async def check_once() -> None:
             or SERVICE_LABEL not in container.labels
         ):
             continue
+        if not await _is_active_deployment(container):
+            continue
 
         healthy, detection = await asyncio.to_thread(assess_container, container)
         container_id = container.id
 
         if healthy:
-            if container_id in _failed_checks:
-                del _failed_checks[container_id]
-            if container_id in _restart_attempts:
-                del _restart_attempts[container_id]
-
             async with SessionLocal() as db:
                 result = await db.execute(
                     select(Incident).where(
@@ -154,18 +164,36 @@ async def check_once() -> None:
                     await db.commit()
             continue
 
-        failed = _failed_checks.get(container_id, 0) + 1
-        _failed_checks[container_id] = failed
+        async with SessionLocal() as db:
+            result = await db.execute(
+                select(Incident).where(
+                    Incident.container_id == container_id,
+                    or_(
+                        Incident.status == "open",
+                        Incident.status == "escalated",
+                    ),
+                )
+            )
+            active_incident = result.scalar_one_or_none()
+        failed = (
+            active_incident.failed_checks + 1
+            if active_incident is not None
+            else 1
+        )
+        restart_attempts = (
+            active_incident.restart_attempts
+            if active_incident is not None
+            else 0
+        )
         if failed < settings.WATCHDOG_FAILED_CHECKS:
             await _record_incident(
                 container,
                 detection=detection,
                 failed_checks=failed,
-                restart_attempts=_restart_attempts.get(container_id, 0),
+                restart_attempts=restart_attempts,
             )
             continue
 
-        restart_attempts = _restart_attempts.get(container_id, 0)
         if restart_attempts >= settings.WATCHDOG_MAX_RESTART_ATTEMPTS:
             await _record_incident(
                 container,
@@ -203,7 +231,6 @@ async def check_once() -> None:
                 assess_container, rechecked
             )
             new_attempt_count = restart_attempts + 1
-            _restart_attempts[container_id] = new_attempt_count
             await _record_incident(
                 container,
                 detection=detection,
@@ -218,7 +245,6 @@ async def check_once() -> None:
                 status="resolved" if recovered else "open",
             )
             if recovered:
-                _failed_checks.pop(container_id, None)
                 logger.info("Container %s recovered after restart", container_id)
             else:
                 logger.warning(
@@ -226,7 +252,6 @@ async def check_once() -> None:
                 )
         except docker.errors.DockerException as error:
             new_attempt_count = restart_attempts + 1
-            _restart_attempts[container_id] = new_attempt_count
             await _record_incident(
                 container,
                 detection=detection,
@@ -236,26 +261,3 @@ async def check_once() -> None:
                 restart_attempts=new_attempt_count,
             )
             logger.error("Restart failed for container %s: %s", container_id, error)
-
-
-async def run_watchdog() -> None:
-    logger.info("Watchdog started")
-    while not _stop_event.is_set():
-        await check_once()
-        try:
-            await asyncio.wait_for(
-                _stop_event.wait(),
-                timeout=settings.WATCHDOG_INTERVAL_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            pass
-    logger.info("Watchdog stopped")
-
-
-def start_watchdog() -> asyncio.Task:
-    _stop_event.clear()
-    return asyncio.create_task(run_watchdog())
-
-
-def stop_watchdog(task: asyncio.Task) -> None:
-    _stop_event.set()

@@ -65,15 +65,27 @@ class DeploymentResponse(BaseModel):
     id: uuid.UUID
     service_id: uuid.UUID
     image_version_id: uuid.UUID | None
+    rollback_of_id: uuid.UUID | None
     image_tag: str
     image_id: str | None
     container_id: str | None
+    queue_job_id: str | None
     status: str
     error: str | None
+    ports: dict[str, int]
+    environment: dict[str, str]
+    health_url: str | None
+    auto_heal: bool
     created_at: datetime
     updated_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class DeploymentJobResponse(BaseModel):
+    deployment_id: uuid.UUID
+    job_id: str
+    job_status: str
 
 
 class DockerContainerResponse(BaseModel):

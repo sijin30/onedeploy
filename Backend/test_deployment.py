@@ -4,10 +4,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
-import docker
 from fastapi import HTTPException
 
 from Routers import deployment
+from models.deployment import Deployment, DeploymentStatus
 from schemas.service import DockerContainerCreate
 
 
@@ -85,7 +85,7 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-    async def test_container_creation_records_requested_image_version(self):
+    async def test_container_creation_enqueues_requested_image_version(self):
         project_id = uuid4()
         service_id = uuid4()
         image_version = SimpleNamespace(
@@ -101,24 +101,14 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         db.add = MagicMock()
         db.commit = AsyncMock()
         current_user = SimpleNamespace(id=uuid4())
-        container = MagicMock()
-        container.id = "container-id"
-        container.name = "service-container"
-        container.status = "running"
-        container.attrs = {
-            "Image": "sha256:image-four",
-            "Config": {"Image": image_version.image_tag},
-            "Created": "2026-11-24T00:00:00Z",
-            "NetworkSettings": {"Ports": {}},
-        }
 
         with (
             patch.object(deployment, "_require_service", new=AsyncMock()),
             patch.object(
-                deployment,
-                "run_in_threadpool",
-                new=AsyncMock(return_value=container),
-            ) as run_in_threadpool,
+                deployment.deployment_queue,
+                "enqueue",
+                return_value=SimpleNamespace(id="queue-job-id"),
+            ) as enqueue,
         ):
             result = await deployment.create_service_container(
                 project_id,
@@ -128,19 +118,21 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
                 current_user,
             )
 
-        history = db.add.call_args.args[0]
-        self.assertEqual(history.image_version_id, image_version.id)
-        self.assertEqual(history.image_tag, image_version.image_tag)
-        self.assertEqual(history.image_id, container.attrs["Image"])
-        self.assertEqual(history.container_id, container.id)
-        self.assertEqual(history.status, "running")
-        self.assertEqual(result.id, container.id)
+        queued_deployment = db.add.call_args.args[0]
+        self.assertEqual(queued_deployment.image_version_id, image_version.id)
+        self.assertEqual(queued_deployment.image_tag, image_version.image_tag)
+        self.assertEqual(queued_deployment.status, "pending")
+        self.assertEqual(queued_deployment.ports, {})
+        self.assertEqual(queued_deployment.environment, {})
+        self.assertEqual(result.id, queued_deployment.id)
+        enqueue.assert_called_once()
+        self.assertEqual(queued_deployment.queue_job_id, "queue-job-id")
         self.assertEqual(
-            run_in_threadpool.await_args.args[1],
-            image_version.image_tag,
+            enqueue.call_args.kwargs["job_id"],
+            str(queued_deployment.id),
         )
 
-    async def test_default_container_creation_uses_latest_immutable_version(self):
+    async def test_default_container_creation_queues_latest_immutable_version(self):
         project_id = uuid4()
         service_id = uuid4()
         image_version = SimpleNamespace(
@@ -155,26 +147,16 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         db.execute = AsyncMock(return_value=query_result)
         db.add = MagicMock()
         db.commit = AsyncMock()
-        container = MagicMock()
-        container.id = "container-id"
-        container.name = "service-container"
-        container.status = "running"
-        container.attrs = {
-            "Image": image_version.image_id,
-            "Config": {"Image": image_version.image_tag},
-            "Created": "2026-11-24T00:00:00Z",
-            "NetworkSettings": {"Ports": {}},
-        }
 
         with (
             patch.object(deployment, "_require_service", new=AsyncMock()),
             patch.object(
-                deployment,
-                "run_in_threadpool",
-                new=AsyncMock(return_value=container),
-            ) as run_in_threadpool,
+                deployment.deployment_queue,
+                "enqueue",
+                return_value=SimpleNamespace(id="queue-job-id"),
+            ) as enqueue,
         ):
-            await deployment.create_service_container(
+            result = await deployment.create_service_container(
                 project_id,
                 service_id,
                 DockerContainerCreate(),
@@ -182,48 +164,142 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
                 SimpleNamespace(id=uuid4()),
             )
 
-        self.assertEqual(
-            run_in_threadpool.await_args.args[1],
-            image_version.image_tag,
-        )
+        self.assertEqual(result.image_tag, image_version.image_tag)
+        enqueue.assert_called_once()
 
-    async def test_failed_container_creation_is_recorded(self):
+    async def test_rollback_queues_previous_successful_deployment(self):
         project_id = uuid4()
         service_id = uuid4()
-        image_version = SimpleNamespace(
+        target = SimpleNamespace(
             id=uuid4(),
-            image_tag=f"onedeploy/{project_id.hex}-{service_id.hex}:v2",
-            image_id="sha256:image-two",
-            status="built",
+            status="failed",
+            created_at="2026-11-26T00:00:00Z",
         )
-        query_result = MagicMock()
-        query_result.scalar_one_or_none.return_value = image_version
+        known_good = SimpleNamespace(
+            id=uuid4(),
+            image_version_id=uuid4(),
+            image_tag=f"onedeploy/{project_id.hex}-{service_id.hex}:v1",
+            image_id="sha256:image-one",
+            ports={"8000/tcp": 8000},
+            environment={"MODE": "production"},
+            health_url="http://localhost:8000/health",
+            auto_heal=False,
+        )
+        target_result = MagicMock()
+        target_result.scalar_one_or_none.return_value = target
+        existing_rollback_result = MagicMock()
+        existing_rollback_result.scalar_one_or_none.return_value = None
+        known_good_result = MagicMock()
+        known_good_result.scalar_one_or_none.return_value = known_good
         db = MagicMock()
-        db.execute = AsyncMock(return_value=query_result)
+        db.execute = AsyncMock(
+            side_effect=[
+                target_result,
+                existing_rollback_result,
+                known_good_result,
+            ]
+        )
         db.add = MagicMock()
         db.commit = AsyncMock()
-        current_user = SimpleNamespace(id=uuid4())
 
         with (
             patch.object(deployment, "_require_service", new=AsyncMock()),
             patch.object(
-                deployment,
-                "run_in_threadpool",
-                new=AsyncMock(
-                    side_effect=docker.errors.ImageNotFound("missing image")
-                ),
-            ),
+                deployment.deployment_queue,
+                "enqueue",
+                return_value=SimpleNamespace(id="rollback-job-id"),
+            ) as enqueue,
+        ):
+            result = await deployment.rollback_service_deployment(
+                project_id,
+                service_id,
+                target.id,
+                db,
+                SimpleNamespace(id=uuid4()),
+            )
+
+        rollback = db.add.call_args.args[0]
+        self.assertEqual(rollback.rollback_of_id, target.id)
+        self.assertEqual(rollback.image_version_id, known_good.image_version_id)
+        self.assertEqual(rollback.image_tag, known_good.image_tag)
+        self.assertEqual(rollback.ports, known_good.ports)
+        self.assertEqual(rollback.environment, known_good.environment)
+        self.assertEqual(rollback.health_url, known_good.health_url)
+        self.assertFalse(rollback.auto_heal)
+        self.assertEqual(rollback.status, "pending")
+        self.assertEqual(result.id, rollback.id)
+        enqueue.assert_called_once()
+        self.assertEqual(rollback.queue_job_id, "rollback-job-id")
+
+    def test_deployment_state_machine_rejects_invalid_transitions(self):
+        deployment_record = Deployment(
+            service_id=uuid4(),
+            image_tag="onedeploy/service:v1",
+            status=DeploymentStatus.PENDING.value,
+        )
+        with self.assertRaises(ValueError):
+            deployment_record.transition_to(DeploymentStatus.RUNNING)
+
+        deployment_record.transition_to(DeploymentStatus.BUILDING)
+        deployment_record.transition_to(DeploymentStatus.RUNNING)
+        deployment_record.transition_to(DeploymentStatus.ROLLED_BACK)
+        self.assertEqual(deployment_record.status, "rolled_back")
+
+    async def test_unavailable_queue_marks_deployment_failed(self):
+        queued_deployment = Deployment(
+            id=uuid4(),
+            service_id=uuid4(),
+            image_tag="onedeploy/service:v1",
+            status=DeploymentStatus.PENDING.value,
+        )
+        db = MagicMock()
+        db.commit = AsyncMock()
+
+        with patch.object(
+            deployment.deployment_queue,
+            "enqueue",
+            side_effect=deployment.RedisError("Redis unavailable"),
         ):
             with self.assertRaises(HTTPException) as raised:
-                await deployment.create_service_container(
-                    project_id,
-                    service_id,
-                    DockerContainerCreate(image_version=2),
-                    db,
-                    current_user,
-                )
+                await deployment._enqueue_deployment(queued_deployment, db)
 
-        self.assertEqual(raised.exception.status_code, 409)
-        history = db.add.call_args.args[0]
-        self.assertEqual(history.status, "failed")
-        self.assertIn("missing image", history.error)
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(queued_deployment.status, DeploymentStatus.FAILED)
+        self.assertIn("Redis unavailable", queued_deployment.error)
+        db.commit.assert_awaited_once()
+
+    async def test_deployment_job_endpoint_returns_rq_status(self):
+        project_id = uuid4()
+        service_id = uuid4()
+        deployment_id = uuid4()
+        deployment_record = SimpleNamespace(
+            id=deployment_id,
+            queue_job_id=str(deployment_id),
+        )
+        query_result = MagicMock()
+        query_result.scalar_one_or_none.return_value = deployment_record
+        db = MagicMock()
+        db.execute = AsyncMock(return_value=query_result)
+        job = SimpleNamespace(
+            id=str(deployment_id),
+            get_status=MagicMock(return_value=SimpleNamespace(value="started")),
+        )
+
+        with (
+            patch.object(deployment, "_require_service", new=AsyncMock()),
+            patch.object(deployment.Job, "fetch", return_value=job) as fetch_job,
+        ):
+            result = await deployment.get_service_deployment_job(
+                project_id,
+                service_id,
+                deployment_id,
+                db,
+                SimpleNamespace(id=uuid4()),
+            )
+
+        self.assertEqual(result.job_id, str(deployment_id))
+        self.assertEqual(result.job_status, "started")
+        fetch_job.assert_called_once_with(
+            str(deployment_id),
+            connection=deployment.redis_connection,
+        )

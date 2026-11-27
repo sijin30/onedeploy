@@ -5,10 +5,6 @@ from services import watchdog
 
 
 class WatchdogTests(unittest.TestCase):
-    def setUp(self):
-        watchdog._failed_checks.clear()
-        watchdog._restart_attempts.clear()
-
     def test_assess_container_rejects_crashed_status(self):
         container = MagicMock()
         container.status = "exited"

@@ -1,5 +1,3 @@
-from contextlib import asynccontextmanager
-
 from fastapi import FastAPI
 
 from Routers.auth import router as auth_router
@@ -8,20 +6,7 @@ from Routers.health import router as health_router
 from Routers.project import router as project_router
 from Routers.service import router as service_router
 from Routers.incidents import router as incidents_router
-from services.watchdog import start_watchdog, stop_watchdog
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    watchdog_task = start_watchdog()
-    try:
-        yield
-    finally:
-        stop_watchdog(watchdog_task)
-        await watchdog_task
-
-
-app = FastAPI(title="OneDeploy", lifespan=lifespan)
+app = FastAPI(title="OneDeploy")
 
 
 app.include_router(health_router)

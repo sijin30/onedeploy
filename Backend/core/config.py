@@ -3,6 +3,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     DATABASE_URL: str
+    REDIS_URL: str = "redis://localhost:6379/0"
 
     JWT_SECRET_KEY: str
     JWT_ALGORITHM: str = "HS256"
@@ -13,6 +14,7 @@ class Settings(BaseSettings):
     WATCHDOG_FAILED_CHECKS: int = 3
     WATCHDOG_MAX_RESTART_ATTEMPTS: int = 3
     WATCHDOG_MEMORY_PERCENT_THRESHOLD: float = 85
+    DEPLOYMENT_HEALTH_TIMEOUT_SECONDS: float = 30
 
     model_config = SettingsConfigDict(
         env_file=".env"

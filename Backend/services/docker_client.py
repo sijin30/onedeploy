@@ -138,6 +138,34 @@ def get_docker_container(container_id: str) -> Container:
         client.close()
 
 
+def get_docker_image(image: str) -> Image:
+    """Retrieve an image by its immutable tag or image ID."""
+    client = create_docker_client()
+    try:
+        return client.images.get(image)
+    finally:
+        client.close()
+
+
+def stop_service_containers(
+    labels: dict[str, str],
+    except_container_id: str | None = None,
+) -> None:
+    """Stop running containers for a service before replacing its deployment."""
+    client = create_docker_client()
+    try:
+        containers = client.containers.list(
+            filters={
+                "label": [f"{key}={value}" for key, value in labels.items()]
+            }
+        )
+        for container in containers:
+            if container.id != except_container_id:
+                container.stop()
+    finally:
+        client.close()
+
+
 def manage_docker_container(
     container_id: str,
     action: ContainerAction,
